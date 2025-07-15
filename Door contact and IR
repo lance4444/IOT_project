@@ -1,0 +1,112 @@
+// 定义引脚
+#define RST_PIN 22
+#define LED_PIN 25
+#define DOOR_PIN 33  // 门磁传感器连接的GPIO引脚
+#define IR_PIN 19    // IR传感器连接的GPIO引脚
+
+// 设备唯一ID
+const String deviceID = "DoorSensor_001"; // 唯一标识符，可根据需要更改
+int lastDoorState = HIGH; // 上次门磁状态
+int lastIrState = LOW;    // 上次IR状态
+unsigned long lastUpdateTime = 0; // 上次更新时间
+const int debounceDelay = 400; // 门磁去抖动时间
+const int irDebounceDelay = 300; // IR去抖动时间
+const int updateInterval = 250; // 更新间隔 (ms)
+bool doorStateSent = false;    // 门磁状态发送标志
+bool irStateSent = false;      // IR状态发送标志
+
+void setup() {
+  Serial.begin(115200); // 串口监视器 (UART0)
+  Serial2.begin(115200, SERIAL_8N1, 16, 17); // UART2，RX=16，TX=17，用于D2D通信
+
+  // 初始化LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // 初始化门磁传感器
+  pinMode(DOOR_PIN, INPUT_PULLUP); // 使用内部上拉电阻，门磁闭合为低电平
+
+  // 初始化IR传感器
+  pinMode(IR_PIN, INPUT); // 假设IR为数字输出，可根据需要添加INPUT_PULLUP
+
+  // 初始化RST引脚
+  pinMode(RST_PIN, OUTPUT);
+  digitalWrite(RST_PIN, LOW); // 尝试低电平复位
+  delay(100);
+  digitalWrite(RST_PIN, HIGH);
+
+  Serial.println("Door Sensor Test Ready");
+}
+
+void loop() {
+  int doorState = digitalRead(DOOR_PIN);
+  unsigned long currentTime = millis();
+
+  // 门磁去抖动和状态稳定检查
+  if (doorState != lastDoorState) {
+    delay(debounceDelay); // 去抖动
+    int stableState = digitalRead(DOOR_PIN); // 读取稳定状态
+    int confirmCount = 0;
+    for (int i = 0; i < 5; i++) {
+      if (digitalRead(DOOR_PIN) == stableState) confirmCount++;
+      delay(15); // 确认间隔
+    }
+    if (confirmCount >= 4 && stableState != lastDoorState) {
+      if (stableState == LOW) { // 门磁闭合
+        digitalWrite(LED_PIN, HIGH);
+        String message = deviceID + ":Door Closed";
+        Serial.println(message);
+        Serial2.println(message);
+        delay(50);
+        digitalWrite(LED_PIN, LOW);
+        doorStateSent = true; // 标记已发送
+        irStateSent = false; // 重置IR发送标志
+      } else { // 门磁断开
+        String message = deviceID + ":Door Open";
+        Serial.println(message);
+        Serial2.println(message);
+        doorStateSent = true; // 标记已发送
+        irStateSent = false; // 重置IR发送标志
+      }
+      lastDoorState = stableState;
+      lastUpdateTime = currentTime;
+    }
+  }
+
+  // 仅在门磁闭合时检查IR状态
+  if (lastDoorState == LOW && !irStateSent) {
+    int irState = digitalRead(IR_PIN);
+    if (irState != lastIrState) {
+      delay(irDebounceDelay); // IR去抖动
+      int stableIrState = digitalRead(IR_PIN);
+      int confirmCount = 0;
+      for (int i = 0; i < 4; i++) {
+        if (digitalRead(IR_PIN) == stableIrState) confirmCount++;
+        delay(10); // 确认间隔
+      }
+      if (confirmCount >= 3 && stableIrState != lastIrState) {
+        Serial.print("IR State Changed to: "); Serial.println(stableIrState);
+        if (stableIrState == HIGH) { // 假设HIGH表示检测到人
+          Serial.println("Person Detected (Local)");
+          Serial2.print("Person Detected"); // 确保发送
+          Serial2.flush(); // 强制发送缓冲区数据
+          delay(20); // 增加延时确保传输
+          Serial.println("Sent Person Detected via UART2"); // 调试信息
+          digitalWrite(LED_PIN, HIGH); // 检测到人时点亮LED
+          delay(200); // 持续200ms
+          digitalWrite(LED_PIN, LOW);
+          irStateSent = true; // 标记已发送
+        }
+        lastIrState = stableIrState;
+      }
+    }
+  }
+
+  // 每updateInterval刷新时间，允许下次发送
+  if (currentTime - lastUpdateTime >= updateInterval) {
+    doorStateSent = false; // 允许下次门磁状态变化发送
+    lastUpdateTime = currentTime;
+  }
+
+  delay(50); // 循环间隔
+}
