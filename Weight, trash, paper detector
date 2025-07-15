@@ -1,0 +1,212 @@
+#include <HX711.h>
+
+// 定义引脚
+#define RST_PIN 22
+#define LED_PIN 25
+#define HX711_DT_PIN 23  // HX711 数据引脚
+#define HX711_SCK_PIN 33 // HX711 时钟引脚
+#define TRIG_PIN_TRASH 18 // HC-SR04 垃圾桶触发引脚
+#define ECHO_PIN_TRASH 19 // HC-SR04 垃圾桶回波引脚
+#define TRIG_PIN_TP 26    // HC-SR04 卫生纸触发引脚
+#define ECHO_PIN_TP 27    // HC-SR04 卫生纸回波引脚
+
+// 设备唯一ID
+const String deviceID = "WeightSensor_001"; // 唯一标识符
+unsigned long lastUpdateTime = 0; // 上次更新时间
+const int updateInterval = 1000;  // 最小更新间隔 (1秒)
+
+HX711 scale;
+
+float calibration_factor = 429.5; // 初始校准因子
+const float offset = 344.22;      // 静态偏移值
+const float lowWeightThreshold = 50.0; // 洗手液重量低阈值 (g)
+const float trashFullThreshold = 20.0; // 垃圾桶距离阈值 (cm)，低於此值表示满
+const float tpLowThreshold = 10.0;     // 卫生纸距离阈值 (cm)，高於此值表示用完
+
+// 警报发送标志
+bool weightAlertSent = false;         // 洗手液警报发送标志
+bool trashAlertSent = false;          // 垃圾桶警报发送标志
+bool tpAlertSent = false;             // 卫生纸警报发送标志
+
+// 恢复正常状态发送标志
+bool weightNormalSent = false;        // 洗手液恢复正常发送标志
+bool trashNormalSent = false;         // 垃圾桶恢复正常发送标志
+bool tpNormalSent = false;            // 卫生纸恢复正常发送标志
+
+// 当前状态跟踪
+bool isWeightLow = false;             // 当前洗手液是否处于低状态
+bool isTrashFull = false;             // 当前垃圾桶是否处于满状态
+bool isTpLow = false;                 // 当前卫生纸是否处于低状态
+
+long readUltrasonic(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 30000); // 30ms超时
+  if (duration == 0) return -1; // 超时返回-1
+  return duration * 0.034 / 2; // 转换为距离 (cm)
+}
+
+void setup() {
+  Serial.begin(115200); // 串口监视器
+  Serial2.begin(115200, SERIAL_8N1, 16, 17); // UART2，RX=16，TX=17，用于D2D通信
+
+  // 初始化LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // 初始化RST引脚
+  pinMode(RST_PIN, OUTPUT);
+  digitalWrite(RST_PIN, LOW); // 尝试低电平复位
+  delay(100);
+  digitalWrite(RST_PIN, HIGH);
+
+  // 初始化HX711
+  Serial.println("Initializing HX711...");
+  scale.begin(HX711_DT_PIN, HX711_SCK_PIN);
+  if (scale.is_ready()) {
+    scale.set_scale(calibration_factor);
+    scale.tare(); // 校准零点
+    Serial.println("HX711 is ready");
+  } else {
+    Serial.println("HX711 not found. Check wiring.");
+    while (1);
+  }
+
+  // 初始化HC-SR04
+  pinMode(TRIG_PIN_TRASH, OUTPUT);
+  pinMode(ECHO_PIN_TRASH, INPUT);
+  pinMode(TRIG_PIN_TP, OUTPUT);
+  pinMode(ECHO_PIN_TP, INPUT);
+}
+
+float readWeight() {
+  long raw_reading = scale.read(); // 读取原始AD值
+  float weight = ((float)raw_reading / calibration_factor) - offset;
+  if (weight < 0) weight = 0.00;
+  return weight;
+}
+
+void sendMessage(String message, String type) {
+  // 清空发送缓冲区
+  Serial2.flush();
+  delay(50); // 确保缓冲区清空
+  
+  Serial2.println(message); // 通过UART2发送
+  Serial2.flush(); // 等待发送完成
+  
+  Serial.println("Sent via UART2: " + message + " (" + type + ")");
+  digitalWrite(LED_PIN, HIGH); // 点亮LED表示发送
+  delay(200); // 保持200ms
+  digitalWrite(LED_PIN, LOW);
+  
+  delay(100); // 发送后等待，避免连续发送冲突
+}
+
+void loop() {
+  if (scale.is_ready()) {
+    float currentWeight = readWeight();
+    long trashDistance = readUltrasonic(TRIG_PIN_TRASH, ECHO_PIN_TRASH);
+    long tpDistance = readUltrasonic(TRIG_PIN_TP, ECHO_PIN_TP);
+
+    Serial.print("Weight: ");
+    Serial.print(currentWeight, 2);
+    Serial.println(" g");
+
+    unsigned long currentTime = millis();
+    bool messageSent = false; // 防止同一循环发送多条消息
+
+    // ===== 洗手液检测 =====
+    if (currentWeight < lowWeightThreshold) {
+      // 洗手液低状态
+      if (!isWeightLow && !weightAlertSent && !messageSent) {
+        // 从正常状态变为低状态，发送警报
+        if (currentTime - lastUpdateTime >= updateInterval) {
+          sendMessage("LowWeightAlert", "Alert");
+          weightAlertSent = true;
+          isWeightLow = true;
+          weightNormalSent = false; // 重置恢复标志
+          lastUpdateTime = currentTime;
+          messageSent = true;
+        }
+      }
+    } else {
+      // 洗手液正常状态
+      if (isWeightLow && !weightNormalSent && !messageSent) {
+        // 从低状态恢复为正常状态，发送恢复消息
+        if (currentTime - lastUpdateTime >= updateInterval) {
+          sendMessage("WeightRefilled", "Normal");
+          weightNormalSent = true;
+          isWeightLow = false;
+          weightAlertSent = false; // 重置警报标志
+          lastUpdateTime = currentTime;
+          messageSent = true;
+        }
+      }
+    }
+
+    // ===== 垃圾桶检测 =====
+    if (trashDistance >= 0 && trashDistance < trashFullThreshold) {
+      // 垃圾桶满状态
+      if (!isTrashFull && !trashAlertSent && !messageSent) {
+        // 从正常状态变为满状态，发送警报
+        if (currentTime - lastUpdateTime >= updateInterval) {
+          sendMessage("TrashFull", "Alert");
+          trashAlertSent = true;
+          isTrashFull = true;
+          trashNormalSent = false; // 重置恢复标志
+          lastUpdateTime = currentTime;
+          messageSent = true;
+        }
+      }
+    } else if (trashDistance >= 0) {
+      // 垃圾桶正常状态
+      if (isTrashFull && !trashNormalSent && !messageSent) {
+        // 从满状态恢复为正常状态，发送恢复消息
+        if (currentTime - lastUpdateTime >= updateInterval) {
+          sendMessage("TrashEmptied", "Normal");
+          trashNormalSent = true;
+          isTrashFull = false;
+          trashAlertSent = false; // 重置警报标志
+          lastUpdateTime = currentTime;
+          messageSent = true;
+        }
+      }
+    }
+
+    // ===== 卫生纸检测 =====
+    if (tpDistance >= 0 && tpDistance > tpLowThreshold) {
+      // 卫生纸低状态
+      if (!isTpLow && !tpAlertSent && !messageSent) {
+        // 从正常状态变为低状态，发送警报
+        if (currentTime - lastUpdateTime >= updateInterval) {
+          sendMessage("ToiletPaperLow", "Alert");
+          tpAlertSent = true;
+          isTpLow = true;
+          tpNormalSent = false; // 重置恢复标志
+          lastUpdateTime = currentTime;
+          messageSent = true;
+        }
+      }
+    } else if (tpDistance >= 0) {
+      // 卫生纸正常状态
+      if (isTpLow && !tpNormalSent && !messageSent) {
+        // 从低状态恢复为正常状态，发送恢复消息
+        if (currentTime - lastUpdateTime >= updateInterval) {
+          sendMessage("ToiletPaperRefilled", "Normal");
+          tpNormalSent = true;
+          isTpLow = false;
+          tpAlertSent = false; // 重置警报标志
+          lastUpdateTime = currentTime;
+          messageSent = true;
+        }
+      }
+    }
+
+  } else {
+    Serial.println("HX711 not ready");
+  }
+  delay(1000); // 循环间隔
+}
