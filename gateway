@@ -1,0 +1,1192 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+
+#define RST_PIN 22
+#define LED_PIN 25
+
+// ⚠️ Important: Change to your actual hotspot information
+const char* ssid = "iPhone";        // Change to your iPhone hotspot name
+const char* password = "12345678";    // Change to your actual password
+
+WebServer server(80);
+
+// Login credentials
+struct User {
+  String username;
+  String password;
+  String role;
+};
+
+User users[] = {
+  {"admin", "admin12345", "admin"},
+  {"user", "12345", "user"}
+};
+
+// Simple session management
+String sessionToken = "";
+String currentUser = "";
+String currentRole = "";
+
+// Status variables
+struct ToiletStatus {
+  bool paperLow = false;
+  bool trashFull = false;
+  bool weightAlert = false;
+  bool doorOpen = false;
+  bool personDetected = false;
+  int peopleCount = 0;
+  int co2Level = 0;
+  int tvocLevel = 0;
+  unsigned long lastUpdate = 0;
+  
+  bool isOccupied() {
+    return !doorOpen && personDetected;
+  }
+  
+  void resetAlerts() {
+    paperLow = false;
+    trashFull = false;
+    weightAlert = false;
+    personDetected = false;
+    peopleCount = 0;  // Also reset people count
+    co2Level = 0;     // Reset air quality readings
+    tvocLevel = 0;
+    Serial.println("🔄 All alerts and counters reset to normal state");
+  }
+  
+  // New function to get status summary
+  String getStatusSummary() {
+    String summary = "Status Summary:\n";
+    summary += "- Paper: " + String(paperLow ? "LOW" : "OK") + "\n";
+    summary += "- Trash: " + String(trashFull ? "FULL" : "OK") + "\n";
+    summary += "- Weight: " + String(weightAlert ? "ALERT" : "OK") + "\n";
+    summary += "- Door: " + String(doorOpen ? "OPEN" : "CLOSED") + "\n";
+    summary += "- People: " + String(peopleCount) + "\n";
+    summary += "- Occupied: " + String(isOccupied() ? "YES" : "NO") + "\n";
+    summary += "- CO2: " + String(co2Level) + "ppm\n";
+    summary += "- TVOC: " + String(tvocLevel) + "ppb";
+    return summary;
+  }
+} toiletStatus;
+
+// Authentication functions
+bool authenticateUser(String username, String pass) {
+  for (int i = 0; i < 2; i++) {
+    if (users[i].username == username && users[i].password == pass) {
+      currentUser = username;
+      currentRole = users[i].role;
+      sessionToken = "session_" + String(millis());
+      return true;
+    }
+  }
+  return false;
+}
+
+bool isAuthenticated() {
+  return sessionToken != "";
+}
+
+bool isAdmin() {
+  return currentRole == "admin";
+}
+
+// Improved WiFi connection function
+bool connectToWiFi() {
+  Serial.println("\n🚽 Smart Toilet Monitoring System Starting...");
+  Serial.println("=====================================");
+  
+  WiFi.disconnect();
+  delay(1000);
+  WiFi.mode(WIFI_STA);
+  delay(1000);
+  
+  Serial.print("📡 Connecting to WiFi: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 60) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
+    
+    if (attempts % 10 == 0) {
+      Serial.println();
+      Serial.print("⏱️ Attempted ");
+      Serial.print(attempts);
+      Serial.println(" seconds...");
+    }
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi connected successfully!");
+    Serial.print("🌐 Web interface URL: http://");
+    Serial.println(WiFi.localIP());
+    return true;
+  } else {
+    Serial.println("\n❌ WiFi connection failed!");
+    return false;
+  }
+}
+
+void processSensorData(String data) {
+  Serial.println("📡 Received data: " + data);
+  
+  int colonIndex = data.indexOf(':');
+  if (colonIndex > 0) {
+    String deviceId = data.substring(0, colonIndex);
+    String value = data.substring(colonIndex + 1);
+    
+    if (deviceId == "DoorSensor_001") {
+      toiletStatus.doorOpen = (value == "Door Open");
+      Serial.println("🚪 Door status: " + value);
+    }
+    else if (deviceId == "PeopleCount") {
+      toiletStatus.peopleCount = value.toInt();
+      Serial.println("👥 People count: " + String(toiletStatus.peopleCount));
+      
+      // Update person detection status based on people count
+      toiletStatus.personDetected = (toiletStatus.peopleCount > 0);
+    }
+  }
+  else {
+    // Handle alert states
+    if (data == "ToiletPaperLow") {
+      toiletStatus.paperLow = true;
+      Serial.println("🧻 Toilet paper low!");
+    }
+    else if (data == "ToiletPaperRefilled") {
+      toiletStatus.paperLow = false;
+      Serial.println("🧻 Toilet paper refilled - back to normal!");
+    }
+    else if (data == "TrashFull") {
+      toiletStatus.trashFull = true;
+      Serial.println("🗑️ Trash bin full!");
+    }
+    else if (data == "TrashEmptied") {
+      toiletStatus.trashFull = false;
+      Serial.println("🗑️ Trash bin emptied - back to normal!");
+    }
+    else if (data == "LowWeightAlert") {
+      toiletStatus.weightAlert = true;
+      Serial.println("⚖️ Low weight alert!");
+    }
+    else if (data == "WeightRefilled") {
+      toiletStatus.weightAlert = false;
+      Serial.println("⚖️ Weight refilled - back to normal!");
+    }
+    else if (data == "Person Detected") {
+      toiletStatus.personDetected = true;
+      Serial.println("👤 Person detected!");
+    }
+    else if (data == "Person Left" || data == "Person Exited") {
+      toiletStatus.personDetected = false;
+      Serial.println("👤 Person left!");
+    }
+    else if (data.indexOf(',') > 0) {
+      // Handle CO2 and TVOC data (format: "co2_value,tvoc_value")
+      int commaIndex = data.indexOf(',');
+      String co2Str = data.substring(0, commaIndex);
+      String tvocStr = data.substring(commaIndex + 1);
+      toiletStatus.co2Level = co2Str.toInt();
+      toiletStatus.tvocLevel = tvocStr.toInt();
+      Serial.println("🌬️ Air quality - CO2: " + String(toiletStatus.co2Level) + "ppm, TVOC: " + String(toiletStatus.tvocLevel) + "ppb");
+    }
+    else {
+      // Log unrecognized data for debugging
+      Serial.println("❓ Unrecognized sensor data: " + data);
+    }
+  }
+  
+  // Update last update timestamp
+  toiletStatus.lastUpdate = millis();
+  
+  // Visual feedback - blink LED
+  digitalWrite(LED_PIN, HIGH);
+  delay(200);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, 16, 17);
+  delay(2000);
+  
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  pinMode(RST_PIN, OUTPUT);
+  digitalWrite(RST_PIN, LOW);
+  delay(100);
+  digitalWrite(RST_PIN, HIGH);
+  Serial.println("✅ Hardware initialization complete");
+
+  if (!connectToWiFi()) {
+    Serial.println("🔄 WiFi connection failed, will continue trying in loop...");
+  }
+
+  server.on("/", handleRoot);
+  server.on("/login", handleLogin);
+  server.on("/logout", handleLogout);
+  server.on("/status", handleStatus);
+  server.on("/reset", handleReset);
+  server.on("/test", handleTest);
+  server.on("/wifi", handleWiFiInfo);
+  
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "404 - Page Not Found");
+  });
+  
+  server.begin();
+  Serial.println("🎉 Web server started successfully!");
+}
+
+void loop() {
+  server.handleClient();
+  
+  // WiFi connection check
+  static unsigned long lastWiFiCheck = 0;
+  if (millis() - lastWiFiCheck > 10000) {
+    lastWiFiCheck = millis();
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("⚠️ WiFi connection lost, attempting reconnection...");
+      connectToWiFi();
+    }
+  }
+  
+  // Handle serial data from IoT devices
+  if (Serial2.available()) {
+    String received = "";
+    unsigned long startTime = millis();
+    
+    while (Serial2.available() && (millis() - startTime < 2000)) {
+      char c = Serial2.read();
+      received += c;
+      if (c == '\n') break;
+    }
+    
+    if (received.length() > 0) {
+      received.trim();
+      processSensorData(received);
+      toiletStatus.lastUpdate = millis();
+    }
+  }
+  
+  // Sensor data timeout check
+  if (millis() - toiletStatus.lastUpdate > 30000 && toiletStatus.lastUpdate > 0) {
+    static unsigned long lastTimeoutWarning = 0;
+    if (millis() - lastTimeoutWarning > 30000) {  // Only warn every 30 seconds
+      Serial.println("⚠️ Sensor data timeout, possible connection issue");
+      Serial.println(toiletStatus.getStatusSummary());
+      lastTimeoutWarning = millis();
+    }
+  }
+  
+  // Optional: Periodic status summary (every 60 seconds)
+  static unsigned long lastStatusPrint = 0;
+  if (millis() - lastStatusPrint > 60000) {
+    lastStatusPrint = millis();
+    if (toiletStatus.lastUpdate > 0) {
+      Serial.println("📊 Periodic Status Check:");
+      Serial.println(toiletStatus.getStatusSummary());
+    }
+  }
+  
+  delay(100);
+}
+
+void handleLogin() {
+  if (server.method() == HTTP_POST) {
+    String username = server.arg("username");
+    String password = server.arg("password");
+    
+    if (authenticateUser(username, password)) {
+      server.sendHeader("Location", "/");
+      server.send(302, "text/plain", "");
+    } else {
+      handleLoginPage("Invalid credentials! Please try again.");
+    }
+  } else {
+    handleLoginPage("");
+  }
+}
+
+void handleLoginPage(String error) {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>EEE4464 EA Project - Login</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Arial', sans-serif;
+            background: linear-gradient(135deg, #f0f8f0 0%, #e8f5e8 100%);
+            color: #2d5a2d;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .login-container {
+            background: white;
+            padding: 40px;
+            border-radius: 15px;
+            box-shadow: 0 4px 20px rgba(76, 175, 80, 0.15);
+            border: 3px solid #4CAF50;
+            max-width: 400px;
+            width: 100%;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .project-title {
+            font-size: 14px;
+            font-weight: bold;
+            margin-bottom: 8px;
+            letter-spacing: 1px;
+            color: #4CAF50;
+        }
+        
+        h1 {
+            font-size: 1.8em;
+            margin-bottom: 8px;
+            color: #2d5a2d;
+        }
+        
+        .subtitle {
+            font-size: 14px;
+            color: #666;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #2d5a2d;
+        }
+        
+        input[type="text"], input[type="password"] {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s ease;
+        }
+        
+        input[type="text"]:focus, input[type="password"]:focus {
+            outline: none;
+            border-color: #4CAF50;
+        }
+        
+        .btn {
+            width: 100%;
+            background: #4CAF50;
+            border: none;
+            color: white;
+            padding: 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        
+        .btn:hover {
+            background: #45a049;
+            transform: translateY(-2px);
+        }
+        
+        .error {
+            color: #f44336;
+            text-align: center;
+            margin-bottom: 20px;
+            font-weight: bold;
+        }
+        
+        .demo-info {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8fcf8;
+            border-radius: 8px;
+            border-left: 4px solid #4CAF50;
+            font-size: 14px;
+        }
+        
+        .demo-info h4 {
+            margin-bottom: 8px;
+            color: #2d5a2d;
+        }
+        
+        .demo-info p {
+            margin: 4px 0;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="header">
+            <div class="project-title">EEE4464 EA PROJECT</div>
+            <h1>🚽 Smart Toilet Monitor</h1>
+            <div class="subtitle">Please login to continue</div>
+        </div>
+        
+        )rawliteral" + (error != "" ? "<div class='error'>" + error + "</div>" : "") + R"rawliteral(
+        
+        <form method="POST" action="/login">
+            <div class="form-group">
+                <label for="username">Username:</label>
+                <input type="text" id="username" name="username" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="password">Password:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            
+            <button type="submit" class="btn">🔑 Login</button>
+        </form>
+        
+        <div class="demo-info">
+            <h4>📋 Demo Accounts:</h4>
+            <p><strong>Admin:</strong> admin / admin12345</p>
+            <p><strong>User:</strong> user / 12345</p>
+        </div>
+    </div>
+</body>
+</html>
+)rawliteral";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleLogout() {
+  sessionToken = "";
+  currentUser = "";
+  currentRole = "";
+  server.sendHeader("Location", "/login");
+  server.send(302, "text/plain", "");
+}
+
+void handleWiFiInfo() {
+  if (!isAuthenticated()) {
+    server.sendHeader("Location", "/login");
+    server.send(302, "text/plain", "");
+    return;
+  }
+  
+  if (!isAdmin()) {
+    server.send(403, "text/plain", "Access Denied - Admin Only");
+    return;
+  }
+  
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>WiFi Information</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f0f8f0;
+            color: #2d5a2d;
+        }
+        .container {
+            max-width: 500px;
+            margin: 0 auto;
+            background: white;
+            padding: 25px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            border-left: 5px solid #4CAF50;
+        }
+        h1 {
+            color: #4CAF50;
+            text-align: center;
+            margin-bottom: 25px;
+        }
+        p {
+            margin: 15px 0;
+            padding: 10px;
+            background: #f8fcf8;
+            border-radius: 5px;
+        }
+        a {
+            display: block;
+            text-align: center;
+            margin-top: 20px;
+            padding: 12px 24px;
+            background: #4CAF50;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+        }
+        a:hover {
+            background: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📶 WiFi Information</h1>
+        <p><strong>Status:</strong> )rawliteral" + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected") + R"rawliteral(</p>
+        <p><strong>SSID:</strong> )rawliteral" + String(ssid) + R"rawliteral(</p>
+        <p><strong>IP Address:</strong> )rawliteral" + WiFi.localIP().toString() + R"rawliteral(</p>
+        <p><strong>Signal Strength:</strong> )rawliteral" + String(WiFi.RSSI()) + R"rawliteral( dBm</p>
+        <p><strong>MAC Address:</strong> )rawliteral" + WiFi.macAddress() + R"rawliteral(</p>
+        <a href='/'>🔙 Back to Main</a>
+    </div>
+</body>
+</html>
+)rawliteral";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleReset() {
+  if (!isAuthenticated()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+  
+  if (!isAdmin()) {
+    server.send(403, "text/plain", "Access Denied - Admin Only");
+    return;
+  }
+  
+  toiletStatus.resetAlerts();
+  Serial.println("🔄 Alerts reset by " + currentUser);
+  server.send(200, "text/plain", "Alerts reset");
+}
+
+void handleTest() {
+  if (!isAuthenticated()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+  
+  if (!isAdmin()) {
+    server.send(403, "text/plain", "Access Denied - Admin Only");
+    return;
+  }
+  
+  toiletStatus.paperLow = true;
+  toiletStatus.co2Level = 1200;
+  toiletStatus.tvocLevel = 3000;
+  toiletStatus.peopleCount = 2;
+  toiletStatus.lastUpdate = millis();
+  
+  Serial.println("🧪 Generated test data by " + currentUser);
+  server.send(200, "text/plain", "Test data generated");
+}
+
+void handleStatus() {
+  if (!isAuthenticated()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+  
+  DynamicJsonDocument doc(1024);
+  
+  doc["paperLow"] = toiletStatus.paperLow;
+  doc["trashFull"] = toiletStatus.trashFull;
+  doc["weightAlert"] = toiletStatus.weightAlert;
+  doc["doorOpen"] = toiletStatus.doorOpen;
+  doc["personDetected"] = toiletStatus.personDetected;
+  doc["peopleCount"] = toiletStatus.peopleCount;
+  doc["co2Level"] = toiletStatus.co2Level;
+  doc["tvocLevel"] = toiletStatus.tvocLevel;
+  doc["occupied"] = toiletStatus.isOccupied();
+  doc["lastUpdate"] = toiletStatus.lastUpdate;
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  server.send(200, "application/json", jsonString);
+}
+
+void handleRoot() {
+  if (!isAuthenticated()) {
+    handleLoginPage("");
+    return;
+  }
+  
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>EEE4464 EA Project - Smart Toilet Monitor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Arial', sans-serif;
+            background: linear-gradient(135deg, #f0f8f0 0%, #e8f5e8 100%);
+            color: #2d5a2d;
+            min-height: 100vh;
+            padding: 15px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 4px 20px rgba(76, 175, 80, 0.15);
+            overflow: hidden;
+            border: 3px solid #4CAF50;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
+            color: white;
+            padding: 25px;
+            text-align: center;
+            position: relative;
+        }
+        
+        .user-info {
+            position: absolute;
+            top: 15px;
+            right: 20px;
+            font-size: 12px;
+            opacity: 0.9;
+        }
+        
+        .logout-btn {
+            background: rgba(255,255,255,0.2);
+            border: 1px solid rgba(255,255,255,0.3);
+            color: white;
+            padding: 5px 10px;
+            border-radius: 15px;
+            text-decoration: none;
+            font-size: 11px;
+            margin-left: 10px;
+            transition: background 0.3s ease;
+        }
+        
+        .logout-btn:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        
+        .project-title {
+            font-size: 16px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            letter-spacing: 1px;
+        }
+        
+        h1 {
+            font-size: 2.2em;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            font-size: 16px;
+            opacity: 0.9;
+        }
+        
+        .content {
+            padding: 25px;
+        }
+        
+        .control-buttons {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-bottom: 25px;
+        }
+        
+        .btn {
+            background: #4CAF50;
+            border: none;
+            color: white;
+            padding: 12px 20px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .btn:hover {
+            background: #45a049;
+            transform: translateY(-2px);
+        }
+        
+        .btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn-icon {
+            font-size: 18px;
+        }
+        
+        .occupied-indicator {
+            font-size: 22px;
+            font-weight: bold;
+            text-align: center;
+            padding: 22px;
+            border-radius: 12px;
+            margin-bottom: 25px;
+            border: 2px solid;
+        }
+        
+        .occupied-available {
+            background: linear-gradient(135deg, #e8f5e8, #f0f9f0);
+            border-color: #4CAF50;
+            color: #2d5a2d;
+        }
+        
+        .occupied-busy {
+            background: linear-gradient(135deg, #ffebee, #fce4ec);
+            border-color: #f44336;
+            color: #c62828;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.7); }
+            70% { box-shadow: 0 0 0 8px rgba(244, 67, 54, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0); }
+        }
+        
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 18px;
+            margin-bottom: 25px;
+        }
+        
+        .status-card {
+            background: #f8fcf8;
+            border: 2px solid #4CAF50;
+            padding: 22px;
+            border-radius: 12px;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+        
+        .status-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 6px 20px rgba(76, 175, 80, 0.2);
+        }
+        
+        .status-card h3 {
+            margin: 0 0 15px 0;
+            font-size: 18px;
+            color: #2d5a2d;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+        
+        .status-card p {
+            margin: 0;
+            font-size: 16px;
+            font-weight: bold;
+        }
+        
+        .card-icon {
+            font-size: 28px;
+        }
+        
+        .card-good {
+            background: #f8fcf8;
+            border-color: #4CAF50;
+            color: #2d5a2d;
+        }
+        
+        .card-warning {
+            background: #fff8e1;
+            border-color: #FF9800;
+            color: #e65100;
+        }
+        
+        .card-danger {
+            background: #ffebee;
+            border-color: #f44336;
+            color: #c62828;
+        }
+        
+        .card-info {
+            background: #e3f2fd;
+            border-color: #2196F3;
+            color: #1565c0;
+        }
+        
+        .last-update {
+            text-align: center;
+            color: #666;
+            font-size: 14px;
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            border-left: 4px solid #4CAF50;
+        }
+        
+        .status-value {
+            font-size: 14px;
+            margin-top: 8px;
+        }
+        
+        .loading {
+            color: #999;
+            font-style: italic;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                margin: 5px;
+                border-radius: 10px;
+            }
+            
+            h1 {
+                font-size: 1.5em;
+            }
+            
+            .subtitle {
+                font-size: 14px;
+            }
+            
+            .content {
+                padding: 15px;
+            }
+            
+            .status-grid {
+                grid-template-columns: 1fr;
+                gap: 12px;
+            }
+            
+            .control-buttons {
+                flex-direction: column;
+                align-items: center;
+            }
+            
+            .btn {
+                width: 100%;
+                max-width: 250px;
+                justify-content: center;
+            }
+            
+            .occupied-indicator {
+                font-size: 16px;
+                padding: 15px;
+            }
+            
+            .status-card {
+                padding: 15px;
+            }
+            
+            .card-icon {
+                font-size: 20px;
+            }
+            
+            .status-card h3 {
+                font-size: 14px;
+            }
+            
+            .status-card p {
+                font-size: 13px;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            body {
+                padding: 8px;
+            }
+            
+            .project-title {
+                font-size: 12px;
+            }
+            
+            h1 {
+                font-size: 1.3em;
+            }
+            
+            .subtitle {
+                font-size: 12px;
+            }
+            
+            .user-info {
+                position: static;
+                text-align: center;
+                margin-top: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="user-info">
+                Logged in as: <strong>)rawliteral";
+  
+  html += currentUser;
+  html += "</strong> (";
+  html += currentRole;
+  html += R"rawliteral()
+                <a href="/logout" class="logout-btn">🚪 Logout</a>
+            </div>
+            <div class="project-title">EEE4464 EA PROJECT</div>
+            <h1><span style="font-size: 1.2em;">🚽</span> Smart Toilet Monitoring System</h1>
+            <div class="subtitle">Real-time Facility Management Dashboard</div>
+        </div>
+        
+        <div class="content">
+            <div class="control-buttons">)rawliteral";
+  
+  // Add admin-only buttons
+  if (isAdmin()) {
+    html += R"rawliteral(
+                <button class="btn" onclick="resetAlerts()">
+                    <span class="btn-icon">🔄</span> Reset Alerts
+                </button>
+                <button class="btn" onclick="generateTest()">
+                    <span class="btn-icon">🧪</span> Test Data
+                </button>)rawliteral";
+  }
+  
+  html += R"rawliteral(
+                <button class="btn" onclick="location.reload()">
+                    <span class="btn-icon">♻️</span> Refresh
+                </button>)rawliteral";
+  
+  if (isAdmin()) {
+    html += R"rawliteral(
+                <button class="btn" onclick="window.open('/wifi', '_blank')">
+                    <span class="btn-icon">📶</span> WiFi Info
+                </button>)rawliteral";
+  }
+  
+  html += R"rawliteral(
+            </div>
+            
+            <div id="occupiedStatus" class="occupied-indicator occupied-available">
+                🔄 Loading Status...
+            </div>
+            
+            <div class="status-grid">
+                <div id="paperCard" class="status-card card-good">
+                    <h3><span class="card-icon">🧻</span> Toilet Paper</h3>
+                    <p id="paperStatus" class="loading">Loading...</p>
+                </div>
+                
+                <div id="trashCard" class="status-card card-good">
+                    <h3><span class="card-icon">🗑️</span> Waste Bin</h3>
+                    <p id="trashStatus" class="loading">Loading...</p>
+                </div>
+                
+                <div id="peopleCard" class="status-card card-info">
+                    <h3><span class="card-icon">👥</span> People Count</h3>
+                    <p id="peopleCount" class="loading">Loading...</p>
+                </div>
+                
+                <div id="doorCard" class="status-card card-good">
+                    <h3><span class="card-icon">🚪</span> Door Status</h3>
+                    <p id="doorStatus" class="loading">Loading...</p>
+                </div>
+                
+                <div id="airCard" class="status-card card-good">
+                    <h3><span class="card-icon">🌬️</span> Air Quality</h3>
+                    <p id="airStatus" class="loading">Loading...</p>
+                    <div class="status-value" id="airDetails"></div>
+                </div>
+                
+                <div id="weightCard" class="status-card card-good">
+                    <h3><span class="card-icon">⚖️</span> Weight Sensor</h3>
+                    <p id="weightStatus" class="loading">Loading...</p>
+                </div>
+            </div>
+            
+            <div class="last-update">
+                <strong>⏰ Last Update:</strong> <span id="lastUpdate">Never</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function updateStatus() {
+            fetch('/status')
+                .then(response => {
+                    if (response.status === 401) {
+                        window.location.href = '/login';
+                        return;
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (!data) return;
+                    
+                    const occupiedDiv = document.getElementById('occupiedStatus');
+                    if (data.occupied) {
+                        occupiedDiv.textContent = '🔴 OCCUPIED - In Use';
+                        occupiedDiv.className = 'occupied-indicator occupied-busy';
+                    } else {
+                        occupiedDiv.textContent = '🟢 AVAILABLE - Ready';
+                        occupiedDiv.className = 'occupied-indicator occupied-available';
+                    }
+                    
+                    updateCard('paperCard', 'paperStatus', data.paperLow, '⚠️ Paper Low!', '✅ Normal');
+                    updateCard('trashCard', 'trashStatus', data.trashFull, '⚠️ Bin Full!', '✅ Normal');
+                    updateCard('weightCard', 'weightStatus', data.weightAlert, '⚠️ Alert!', '✅ Normal');
+                    
+                    const peopleCard = document.getElementById('peopleCard');
+                    peopleCard.className = 'status-card card-info';
+                    document.getElementById('peopleCount').textContent = data.peopleCount + ' Person(s)';
+                    
+                    const doorCard = document.getElementById('doorCard');
+                    const doorStatus = document.getElementById('doorStatus');
+                    if (data.doorOpen) {
+                        doorCard.className = 'status-card card-good';
+                        doorStatus.textContent = '🔓 Open';
+                    } else {
+                        doorCard.className = 'status-card card-danger';
+                        doorStatus.textContent = '🔒 Closed';
+                    }
+                    
+                    const airCard = document.getElementById('airCard');
+                    const airStatus = document.getElementById('airStatus');
+                    const airDetails = document.getElementById('airDetails');
+                    
+                    if (data.co2Level > 2000 || data.tvocLevel > 5000) {
+                        airCard.className = 'status-card card-danger';
+                        airStatus.textContent = '⚠️ Poor';
+                    } else if (data.co2Level > 1000 || data.tvocLevel > 2000) {
+                        airCard.className = 'status-card card-warning';
+                        airStatus.textContent = '⚡ Fair';
+                    } else {
+                        airCard.className = 'status-card card-good';
+                        airStatus.textContent = '✅ Good';
+                    }
+                    
+                    airDetails.textContent = `CO₂: ${data.co2Level}ppm | TVOC: ${data.tvocLevel}ppb`;
+                    
+                    document.getElementById('lastUpdate').textContent = new Date().toLocaleString();
+                })
+                .catch(error => {
+                    console.error('Status fetch failed:', error);
+                    document.getElementById('occupiedStatus').textContent = '❌ Connection Lost';
+                    document.getElementById('occupiedStatus').className = 'occupied-indicator occupied-busy';
+                });
+        }
+        
+        function updateCard(cardId, statusId, isAlert, alertText, normalText) {
+            const card = document.getElementById(cardId);
+            const status = document.getElementById(statusId);
+            if (isAlert) {
+                card.className = 'status-card card-danger';
+                status.textContent = alertText;
+            } else {
+                card.className = 'status-card card-good';
+                status.textContent = normalText;
+            }
+        }
+        
+        function resetAlerts() {
+            fetch('/reset')
+                .then(response => {
+                    if (response.status === 403) {
+                        showNotification('❌ Access Denied - Admin Only!', 'error');
+                        return;
+                    }
+                    if (response.ok) {
+                        showNotification('✅ Alerts Reset!', 'success');
+                        updateStatus();
+                    } else {
+                        showNotification('❌ Reset Failed!', 'error');
+                    }
+                });
+        }
+        
+        function generateTest() {
+            fetch('/test')
+                .then(response => {
+                    if (response.status === 403) {
+                        showNotification('❌ Access Denied - Admin Only!', 'error');
+                        return;
+                    }
+                    if (response.ok) {
+                        showNotification('🧪 Test Data Generated!', 'success');
+                        updateStatus();
+                    } else {
+                        showNotification('❌ Generation Failed!', 'error');
+                    }
+                });
+        }
+        
+        function showNotification(message, type) {
+            const notification = document.createElement('div');
+            notification.textContent = message;
+            notification.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                padding: 12px 20px;
+                border-radius: 8px;
+                color: white;
+                font-weight: bold;
+                z-index: 1000;
+                opacity: 0;
+                transition: opacity 0.3s ease;
+                ${type === 'success' ? 'background: #4CAF50;' : 'background: #f44336;'}
+            `;
+            
+            document.body.appendChild(notification);
+            
+            setTimeout(() => notification.style.opacity = '1', 100);
+            setTimeout(() => {
+                notification.style.opacity = '0';
+                setTimeout(() => document.body.removeChild(notification), 300);
+            }, 3000);
+        }
+        
+        setInterval(updateStatus, 3000);
+        updateStatus();
+    </script>
+</body>
+</html>
+)rawliteral";
+  
+  server.send(200, "text/html", html);
+}
